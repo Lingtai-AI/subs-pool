@@ -25,6 +25,15 @@ from .accounts import Account, AccountStore, LEGACY_QUOTA_EPOCH
 
 SCHEMA_VERSION = 1
 MODULE = "codex"
+# An account is treated as exhausted at this many percent remaining, not at zero. A window read as
+# 0.4 per cent is already too thin to finish a long turn, and the failure it produces is expensive and
+# ugly: the request dies upstream mid-run, and a harness that cannot see the cause records it as the
+# agent's failure (measured 2026-09-20: three trials filed as reward 0.0 for a missing answer file
+# after a workspace ran dry). Retiring the account a little early costs a fraction of a window and
+# turns a hard failure into a routing decision. Override per store, or with
+# SUBS_POOL_EXHAUST_THRESHOLD.
+EXHAUST_THRESHOLD_PERCENT = 0.5
+
 MAX_AGE_SECONDS = 60.0
 REFRESH_TARGET_SECONDS = 30.0
 STATE_LOCK_SECONDS = 1.0
@@ -572,9 +581,10 @@ class QuotaStore:
             secondary = sample.get("secondary", {}) if isinstance(sample, Mapping) else {}
             primary_remaining = primary.get("remaining_percent")
             secondary_remaining = secondary.get("remaining_percent")
-            usable_secondary = secondary_remaining is None or (isinstance(secondary_remaining, (int, float)) and secondary_remaining > 0)
-            if not allowed or exhausted or primary_remaining is None or primary_remaining <= 0 or not usable_secondary:
-                reason = "exhausted" if (not allowed or exhausted or (primary_remaining is not None and primary_remaining <= 0) or (secondary_remaining is not None and secondary_remaining <= 0)) else "never_checked"
+            thr = self.exhaust_threshold
+            usable_secondary = secondary_remaining is None or (isinstance(secondary_remaining, (int, float)) and secondary_remaining > thr)
+            if not allowed or exhausted or primary_remaining is None or primary_remaining <= thr or not usable_secondary:
+                reason = "exhausted" if (not allowed or exhausted or (primary_remaining is not None and primary_remaining <= thr) or (secondary_remaining is not None and secondary_remaining <= thr)) else "never_checked"
             else:
                 reason = None
             freshness = "fresh"
@@ -637,6 +647,18 @@ class QuotaStore:
         unsatisfied_refs = unsatisfied_refs or set()
         return [self.view_for(account, snapshot, now=now, unsatisfied=account.ref in unsatisfied_refs) for account in accounts]
 
+    @property
+    def exhaust_threshold(self) -> float:
+        """Percent remaining at or below which an account is retired from routing."""
+        v = getattr(self, "_exhaust_threshold", None)
+        if v is not None:
+            return v
+        raw = os.environ.get("SUBS_POOL_EXHAUST_THRESHOLD")
+        try:
+            return float(raw) if raw is not None else EXHAUST_THRESHOLD_PERCENT
+        except ValueError:
+            return EXHAUST_THRESHOLD_PERCENT
+
     def is_eligible(self, account: Account, *, snapshot: Mapping[str, Any] | None = None, now: datetime | None = None) -> bool:
         snapshot = snapshot if snapshot is not None else self.read()
         return bool(self.view_for(account, snapshot, now=now)["eligible"])
@@ -644,6 +666,7 @@ class QuotaStore:
 
 __all__ = [
     "ClockGuard",
+    "EXHAUST_THRESHOLD_PERCENT",
     "MAX_AGE_SECONDS",
     "MODULE",
     "QuotaStateError",

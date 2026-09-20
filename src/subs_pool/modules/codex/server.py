@@ -10,6 +10,7 @@ session identity: the matched (or freshly issued) chain id.
 
 from __future__ import annotations
 
+import logging
 import asyncio
 import hmac
 from contextlib import asynccontextmanager
@@ -70,6 +71,9 @@ _CONFIG_FIELDS = (
 # reference/lingtai-kernel adapter.py, the `reasoning.encrypted_content`
 # `include` default applied unconditionally before the request is built).
 _REQUIRED_INCLUDE = "reasoning.encrypted_content"
+
+
+logger = logging.getLogger("subs_pool.codex.server")
 
 
 def _normalize_body(body: object) -> object:
@@ -403,6 +407,12 @@ def create_app(
                 chain_store=chain_store,
                 quota_store=quota_store,
                 snapshot=quota_snapshot,
+                # The server opts in where the library will not decide for itself: if a continuation's
+                # account has been retired (exhausted, or at/below the exhaust threshold), the caller's
+                # alternative is a dead turn, and a harness that cannot see why will record that as the
+                # agent's failure. Moving it costs the upstream prompt cache for this prefix, which is
+                # why the move is logged rather than silent.
+                reroute_retired=True,
             )
         except NoEligibleAccountError as exc:
             return JSONResponse(
@@ -436,6 +446,10 @@ def create_app(
         # always the routed chain id (reused on continuation, fresh on
         # no-match). A caller's body `prompt_cache_key` is replaced and caller
         # `session_id` / `thread_id` headers are never read.
+        if decision.rerouted_from:
+            logger.warning(
+                "chain %s rerouted off retired account %s onto %s: the prefix's prompt cache is lost "
+                "on the new account", decision.chain_id, decision.rerouted_from, decision.account_ref)
         identity = decision.chain_id
         payload["prompt_cache_key"] = identity
         want_stream = bool(body.get("stream", False))
