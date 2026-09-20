@@ -534,12 +534,23 @@ def create_app(
 
             async def event_stream() -> AsyncIterator[bytes]:
                 outcome = first_outcome
+                committed = False
                 yield encode_event(first_event.get("type", "message"), first_event)
                 async for event, outcome in driver:
+                    # Commit the moment upstream's terminal event is in hand, BEFORE it is
+                    # forwarded. Codex hangs up as soon as it has read response.completed, so a
+                    # commit placed after the loop ran for about one turn in four (75 of 313 on
+                    # the 2026-09-20 identify666terms trial): the baseline went stale and the
+                    # usage meter undercounted by the same factor. A turn upstream finished is a
+                    # turn that happened, whether or not the client waits for our EOF.
+                    if outcome.final_response is not None and not committed:
+                        commit_on_success(outcome)
+                        committed = True
                     if await request.is_disconnected():
-                        return  # cancellation: no fake completion, no commit
+                        return  # cancellation mid-turn: no fake completion, no commit
                     yield encode_event(event.get("type", "message"), event)
-                commit_on_success(outcome)
+                if not committed:
+                    commit_on_success(outcome)
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
