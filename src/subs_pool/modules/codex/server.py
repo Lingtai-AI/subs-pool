@@ -10,9 +10,12 @@ session identity: the matched (or freshly issued) chain id.
 
 from __future__ import annotations
 
+import json
 import logging
 import asyncio
 import hmac
+import os
+import time
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
@@ -129,6 +132,35 @@ def _with_encrypted_reasoning_include(body: dict) -> dict:
     if _REQUIRED_INCLUDE not in existing:
         existing = [*existing, _REQUIRED_INCLUDE]
     return {**body, "include": existing}
+
+
+def _meter(outcome: "_RunOutcome", decision) -> None:
+    """One JSON line per upstream response, to the file named by SUBS_POOL_USAGE_LOG, if any.
+
+    Counts only: tokens in, tokens served from the upstream prompt cache, tokens out, which chain and
+    account, and whether the chain was matched or fresh. No conversation content, no credential, no
+    request body. It exists because the relay's one job -- keeping a conversation on the account that
+    holds its prompt cache -- was failing for weeks with nothing to show it: 54 per cent of input
+    cached through the relay against 98 direct, found only by reading finished traces. A relay that
+    cannot report its own cache hit rate cannot be trusted to have one. Never raises.
+    """
+    path = os.environ.get("SUBS_POOL_USAGE_LOG")
+    if not path:
+        return
+    try:
+        usage = ((outcome.final_response or {}).get("usage") or {}) if outcome else {}
+        details = usage.get("input_tokens_details") or {}
+        line = {"t": round(time.time(), 3), "chain": str(decision.chain_id)[-8:],
+                "account": decision.account_ref, "matched": bool(decision.matched),
+                "rerouted_from": getattr(decision, "rerouted_from", None),
+                "input": usage.get("input_tokens"), "cached": details.get("cached_tokens"),
+                "output": usage.get("output_tokens"),
+                "status": (outcome.final_response or {}).get("status") if outcome else None,
+                "error": bool(outcome and outcome.error is not None)}
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line) + "\n")
+    except Exception:                                   # a meter must never cost a turn
+        return
 
 
 def _extract_config(body: dict) -> dict:
@@ -455,6 +487,7 @@ def create_app(
         want_stream = bool(body.get("stream", False))
 
         def commit_on_success(outcome: _RunOutcome) -> None:
+            _meter(outcome, decision)
             if outcome.error is not None or outcome.final_response is None:
                 return
             if outcome.final_response.get("status") != "completed":
