@@ -45,6 +45,13 @@ without `quota_epoch` mean `legacy-v1` for compatibility. Mutations that
 change enablement, auth, or identity advance the epoch and remove its quota
 record.
 
+The local Responses server forwards request fields unchanged, with three
+owning-layer translations: `stream` is always true and `store` is always false
+upstream, and the standard sampling/length controls Codex rejects with HTTP 400
+(`max_output_tokens`, `temperature`, `top_p`, `truncation`) are omitted from
+the upstream request. Unsupported stateful fields (`previous_response_id`,
+`conversation`, truthy `store`/`background`) are rejected locally with 400.
+
 The foreground server remains `--listen 127.0.0.1:8765`, loopback-only, and
 user-managed. It refreshes on startup, at the 30-second target while running,
 and just-in-time when no current candidate exists. It does not install a

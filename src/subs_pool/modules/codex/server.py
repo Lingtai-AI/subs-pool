@@ -48,7 +48,8 @@ _REJECTED_UNLESS_FALSE = {
 
 # Inputs that can alter model behaviour or the shape/content of a completion.
 # Transport-only fields (`input`, `stream`) are intentionally excluded; all
-# other request fields are forwarded unchanged rather than silently discarded.
+# other request fields are forwarded unchanged rather than silently discarded,
+# except the documented Codex-omitted controls below.
 _CONFIG_FIELDS = (
     "model",
     "instructions",
@@ -131,9 +132,21 @@ def _extract_config(body: dict) -> dict:
     return {k: body.get(k) for k in _CONFIG_FIELDS}
 
 
+# Standard Responses sampling/length controls that the Codex backend rejects
+# with HTTP 400. Ordinary OpenAI SDK clients send them, so the Codex module
+# omits them from the upstream request as an owning-layer translation (like
+# forcing stream/store below) instead of failing every such request upstream.
+# They stay in the effective config used for affinity (`_CONFIG_FIELDS`).
+_CODEX_OMITTED_FIELDS = frozenset({"max_output_tokens", "temperature", "top_p", "truncation"})
+
+
 def _forward_payload(body: dict) -> dict:
     rejectable = {**_REJECTED_ALWAYS, **_REJECTED_UNLESS_FALSE}
-    payload = {k: v for k, v in body.items() if k not in rejectable}
+    payload = {
+        k: v
+        for k, v in body.items()
+        if k not in rejectable and k not in _CODEX_OMITTED_FIELDS
+    }
     # The server always talks to Upstream in streaming mode so it can relay
     # real incremental events to streaming clients; a non-streaming client's
     # response is an aggregate of that same stream. The client's `stream`

@@ -638,6 +638,41 @@ async def test_encrypted_reasoning_include_default_forwarded_and_preserves_calle
 
 
 @pytest.mark.asyncio
+async def test_codex_rejected_sampling_fields_are_omitted_upstream(tmp_path):
+    """Codex rejects max_output_tokens/temperature/top_p/truncation with 400;
+    an ordinary SDK request carrying them must still succeed, with those
+    fields omitted from the upstream payload and everything else forwarded."""
+    accounts = _setup_one_account(tmp_path)
+    upstream = ScriptedUpstream()
+    upstream.queue_success(
+        model="gpt-5-codex",
+        output=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hi"}]}],
+    )
+    app = create_app(accounts=accounts, chain_store=ChainStore(), upstream=upstream, api_key=API_KEY)
+
+    async with _client(app) as client:
+        resp = await client.post(
+            "/v1/responses",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={
+                "model": "gpt-5-codex",
+                "input": [{"role": "user", "content": "hello"}],
+                "max_output_tokens": 1024,
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "truncation": "auto",
+                "service_tier": "priority",
+            },
+        )
+    assert resp.status_code == 200
+    payload = upstream.calls[0]["payload"]
+    for field in ("max_output_tokens", "temperature", "top_p", "truncation"):
+        assert field not in payload
+    assert payload["service_tier"] == "priority"
+    assert payload["model"] == "gpt-5-codex"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "extra_headers,body_extra",
     [
