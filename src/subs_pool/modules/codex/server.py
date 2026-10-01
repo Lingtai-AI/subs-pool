@@ -10,8 +10,12 @@ session identity: the matched (or freshly issued) chain id.
 
 from __future__ import annotations
 
+import json
+import logging
 import asyncio
 import hmac
+import os
+import time
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 
@@ -73,6 +77,9 @@ _CONFIG_FIELDS = (
 _REQUIRED_INCLUDE = "reasoning.encrypted_content"
 
 
+logger = logging.getLogger("subs_pool.codex.server")
+
+
 def _normalize_body(body: object) -> object:
     """Losslessly normalize ordinary SDK request shapes before validation.
 
@@ -126,6 +133,35 @@ def _with_encrypted_reasoning_include(body: dict) -> dict:
     if _REQUIRED_INCLUDE not in existing:
         existing = [*existing, _REQUIRED_INCLUDE]
     return {**body, "include": existing}
+
+
+def _meter(outcome: "_RunOutcome", decision) -> None:
+    """One JSON line per upstream response, to the file named by SUBS_POOL_USAGE_LOG, if any.
+
+    Counts only: tokens in, tokens served from the upstream prompt cache, tokens out, which chain and
+    account, and whether the chain was matched or fresh. No conversation content, no credential, no
+    request body. It exists because the relay's one job -- keeping a conversation on the account that
+    holds its prompt cache -- was failing for weeks with nothing to show it: 54 per cent of input
+    cached through the relay against 98 direct, found only by reading finished traces. A relay that
+    cannot report its own cache hit rate cannot be trusted to have one. Never raises.
+    """
+    path = os.environ.get("SUBS_POOL_USAGE_LOG")
+    if not path:
+        return
+    try:
+        usage = ((outcome.final_response or {}).get("usage") or {}) if outcome else {}
+        details = usage.get("input_tokens_details") or {}
+        line = {"t": round(time.time(), 3), "chain": str(decision.chain_id)[-8:],
+                "account": decision.account_ref, "matched": bool(decision.matched),
+                "rerouted_from": getattr(decision, "rerouted_from", None),
+                "input": usage.get("input_tokens"), "cached": details.get("cached_tokens"),
+                "output": usage.get("output_tokens"),
+                "status": (outcome.final_response or {}).get("status") if outcome else None,
+                "error": bool(outcome and outcome.error is not None)}
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line) + "\n")
+    except Exception:                                   # a meter must never cost a turn
+        return
 
 
 def _extract_config(body: dict) -> dict:
@@ -416,6 +452,12 @@ def create_app(
                 chain_store=chain_store,
                 quota_store=quota_store,
                 snapshot=quota_snapshot,
+                # The server opts in where the library will not decide for itself: if a continuation's
+                # account has been retired (exhausted, or at/below the exhaust threshold), the caller's
+                # alternative is a dead turn, and a harness that cannot see why will record that as the
+                # agent's failure. Moving it costs the upstream prompt cache for this prefix, which is
+                # why the move is logged rather than silent.
+                reroute_retired=True,
             )
         except NoEligibleAccountError as exc:
             return JSONResponse(
@@ -449,11 +491,16 @@ def create_app(
         # always the routed chain id (reused on continuation, fresh on
         # no-match). A caller's body `prompt_cache_key` is replaced and caller
         # `session_id` / `thread_id` headers are never read.
+        if decision.rerouted_from:
+            logger.warning(
+                "chain %s rerouted off retired account %s onto %s: the prefix's prompt cache is lost "
+                "on the new account", decision.chain_id, decision.rerouted_from, decision.account_ref)
         identity = decision.chain_id
         payload["prompt_cache_key"] = identity
         want_stream = bool(body.get("stream", False))
 
         def commit_on_success(outcome: _RunOutcome) -> None:
+            _meter(outcome, decision)
             if outcome.error is not None or outcome.final_response is None:
                 return
             if outcome.final_response.get("status") != "completed":
@@ -500,12 +547,23 @@ def create_app(
 
             async def event_stream() -> AsyncIterator[bytes]:
                 outcome = first_outcome
+                committed = False
                 yield encode_event(first_event.get("type", "message"), first_event)
                 async for event, outcome in driver:
+                    # Commit the moment upstream's terminal event is in hand, BEFORE it is
+                    # forwarded. Codex hangs up as soon as it has read response.completed, so a
+                    # commit placed after the loop ran for about one turn in four (75 of 313 on
+                    # the 2026-09-20 identify666terms trial): the baseline went stale and the
+                    # usage meter undercounted by the same factor. A turn upstream finished is a
+                    # turn that happened, whether or not the client waits for our EOF.
+                    if outcome.final_response is not None and not committed:
+                        commit_on_success(outcome)
+                        committed = True
                     if await request.is_disconnected():
-                        return  # cancellation: no fake completion, no commit
+                        return  # cancellation mid-turn: no fake completion, no commit
                     yield encode_event(event.get("type", "message"), event)
-                commit_on_success(outcome)
+                if not committed:
+                    commit_on_success(outcome)
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 

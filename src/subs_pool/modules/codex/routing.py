@@ -2,6 +2,11 @@
 
 Rule A — no match: weighted pick among eligible pool accounts.
 Rule B — full-prefix match + account still eligible: sticky to that account.
+Rule C — opt-in (``reroute_retired=True``): a full-prefix match whose bound account
+has been retired (exhausted, or at/below the exhaust threshold) is rerouted to a
+weighted pick, and the move is reported in ``rerouted_from``. Off by default, so the
+library keeps its promise never to move a continuation on its own; the server turns it
+on because a caller's alternative there is a dead turn.
 
 Eligibility here means "in the pool, enabled, and authenticated" (an
 account with a missing/invalid auth file is explicitly unavailable — never
@@ -31,6 +36,7 @@ class RoutingDecision:
     chain_id: str
     matched: bool
     prefix_hashes: list
+    rerouted_from: str | None = None   # set when a continuation was moved off a retired account
 
 
 def _is_authenticated(account: Account, *, root: Path | None = None) -> bool:
@@ -97,17 +103,25 @@ def select_account(
     randbelow=None,
     quota_store: QuotaStore | None = None,
     snapshot: dict | None = None,
+    reroute_retired: bool = False,
 ) -> RoutingDecision:
     elig = eligible_refs(accounts, quota_store=quota_store, snapshot=snapshot)
     if not elig:
         raise NoEligibleAccountError("no current quota-eligible account")
 
-    # Preserve hard continuation affinity: a matching committed chain whose
-    # bound account has gone stale/exhausted is a local unavailable result,
-    # not permission to rewrite the conversation onto another account.
+    # Continuation affinity is held as hard as it can be: a matching chain stays on its account for as
+    # long as that account is eligible, because moving it costs the upstream prompt cache for the whole
+    # prefix (tens of millions of tokens in a long agent run) and that is the cache the chain exists to
+    # earn. But when the bound account has been retired -- exhausted, or under the exhaust threshold --
+    # refusing is worse than moving: the caller's alternative is a dead turn, and a harness that cannot
+    # see why records it as the agent's failure. So the continuation is rerouted, and `rerouted_from`
+    # carries which account it left, so the move is announced rather than silent (CONTRACT.md).
     bound = chain_store.find_bound(input_items, cfg)
+    rerouted_from = None
     if bound.account_ref is not None and bound.account_ref not in elig:
-        raise NoEligibleAccountError("the bound account has no current quota")
+        if not reroute_retired:
+            raise NoEligibleAccountError("the bound account has no current quota")
+        rerouted_from = bound.account_ref
 
     match: MatchResult = chain_store.find_match(input_items, cfg, elig)
     if match.account_ref is not None:
@@ -122,7 +136,8 @@ def select_account(
     chosen = weighted_choice(eligible_accounts, randbelow=randbelow)
     return RoutingDecision(
         account_ref=chosen,
-        chain_id=match.chain_id,
+        chain_id=(bound.chain_id if rerouted_from else match.chain_id),
+        rerouted_from=rerouted_from,
         matched=False,
         prefix_hashes=match.prefix_hashes,
     )
