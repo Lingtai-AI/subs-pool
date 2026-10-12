@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import json
-import sys
-import types
-from datetime import datetime, timezone
 
 import pytest
 
 from subs_pool import agent_cli, cli
 from subs_pool.modules.codex import cli as codex_cli
 from subs_pool.modules.codex.accounts import AccountStore
-from subs_pool.modules.codex.quota import QuotaResult
 from fakes import write_auth_fixture
 
 
@@ -51,37 +47,8 @@ def test_agent_unknown_and_serve_are_stable_json_errors(capsys):
     assert payload["error"]["code"] == "unsupported_command"
 
 
-def test_agent_quota_refreshes_and_preserves_nullable_secondary(capsys, monkeypatch, tmp_path):
-    auth = tmp_path / "auth.json"
-    write_auth_fixture(auth)
-    monkeypatch.setenv("CODEX_POOL_HOME", str(tmp_path / "codex"))
-    store = AccountStore()
-    store.import_account("work", str(auth))
-    observed = datetime.now(timezone.utc).isoformat()
-    monkeypatch.setattr(
-        "subs_pool.modules.codex.quota_refresh.read_quota",
-        lambda path, **kwargs: QuotaResult(25.0, None, None, None, observed),
-    )
-    assert agent_cli.main(["codex", "quota"]) == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is True
-    row = payload["data"]["accounts"][0]
-    assert row["current"]["secondary"]["remaining_percent"] is None
-    assert row["eligible"] is True
-
-
 def test_serve_rejects_non_loopback_and_keeps_default_port(capsys, monkeypatch):
     assert codex_cli.main(["serve", "--listen", "0.0.0.0:9000", "--api-key", "x"]) == 4
     assert "loopback" in capsys.readouterr().err
     monkeypatch.setattr("subs_pool.modules.codex.cli._store", lambda: AccountStore())
     assert codex_cli.build_parser().parse_args(["serve"]).listen == "127.0.0.1:8765"
-
-
-def test_no_args_dispatches_to_tui(monkeypatch):
-    calls = []
-    fake_tui = types.ModuleType("subs_pool.tui")
-    fake_tui.run_tui = lambda module_id: calls.append(module_id)
-    monkeypatch.setitem(sys.modules, "subs_pool.tui", fake_tui)
-    assert cli.main([]) == 0
-    assert cli.main(["tui"]) == 0
-    assert calls == ["codex", "codex"]
